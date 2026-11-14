@@ -7,12 +7,16 @@ routes, registers its port and catalog with the env at $MAKEFUN_ENV_URL,
 and answers the env client's OpenAI Chat Completions and Anthropic Messages
 requests (JSON and SSE) with the best free model that meets each request.
 
-Routing is deterministic: candidates are ranked by the sealed quality
-table's rating_milli (highest first, ties by provider then model id), and a
-provider call that refuses (402/429/5xx) fails over to the next candidate.
-Every choice is a function of the brief, the requests and the providers'
-answers: no wall clock, no unseeded randomness, so a replay reproduces the
-live pass byte for byte.
+Routing is deterministic: candidates are ranked by attempt bucket first
+(fewest upstream attempts to that provider win, so the load spreads
+instead of hammering one provider to exhaustion) and then by the sealed
+quality table's rating_milli (highest first, ties by provider then model
+id). A provider call that refuses (402/429/5xx) fails over to the next
+candidate; the refusal's message tells whether the provider's budget is
+spent or it is out (never tried again) or it was one scheduled fail call
+(the provider stays eligible). Every choice is a function of the brief,
+the requests and the providers' answers: no wall clock, no unseeded
+randomness, so a replay reproduces the live pass byte for byte.
 
   python3 main.py --list    print the catalog document and exit 0
   python3 main.py           run the trial server (needs the brief + env)
@@ -396,9 +400,21 @@ class Router:
     in outage (a single refusal is usually its scheduled fail call, and
     the next call to it still answers), so it is demoted to the back of the
     ranking until it answers again; it is never dropped outright.
+
+    Calls are also spread across providers: candidates are ranked by
+    attempt bucket first (fewest upstream attempts to that provider win),
+    so no provider is hammered to exhaustion while others sit idle.
+    The first call to any provider always answers (a provider's failure
+    schedule starts at call 2), so spreading the first wave over all ten
+    providers costs no failed calls. A provider whose refusal says its
+    budget is spent, or that it is out, is dead for the rest of the trial
+    and never tried again; a plain refusal is one scheduled fail call and
+    the provider stays eligible.
     """
 
     DEMOTE_AFTER = 2
+    ATTEMPT_BUCKET = 3
+    RATING_GATE = 45
 
     def __init__(self, brief, catalog, caps):
         self.brief = brief
@@ -406,6 +422,14 @@ class Router:
         self.caps = caps
         self.by_provider = {p["id"]: p for p in brief["providers"]}
         self.consecutive_failures = {}
+        self.attempts = {}
+        self.dead = set()
+
+    def note_attempt(self, provider_id):
+        self.attempts[provider_id] = self.attempts.get(provider_id, 0) + 1
+
+    def mark_dead(self, provider_id):
+        self.dead.add(provider_id)
 
     def note_success(self, provider_id):
         self.consecutive_failures[provider_id] = 0
@@ -422,6 +446,8 @@ class Router:
             provider = self.by_provider.get(entry["id"])
             if provider is None:
                 continue
+            if entry["id"] in self.dead:
+                continue
             for model in entry["models"]:
                 caps = capabilities_of(self.caps, entry["id"], model["id"])
                 if not caps["free"]:
@@ -436,8 +462,38 @@ class Router:
                     "provider": provider, "model_id": model["id"],
                     "rating": caps["rating_milli"],
                 })
+        if not out:
+            # Every provider is dead (budgets spent / outages): fall back to
+            # the full list so a request still gets an attempted answer
+            # instead of an immediate 503.
+            for entry in self.catalog["providers"]:
+                provider = self.by_provider.get(entry["id"])
+                if provider is None:
+                    continue
+                for model in entry["models"]:
+                    caps = capabilities_of(self.caps, entry["id"], model["id"])
+                    if not caps["free"]:
+                        continue
+                    if not meets_requirements(requires, caps):
+                        continue
+                    if json_mode and client_api == "openai" and provider["wire"] == "anthropic":
+                        continue
+                    out.append({
+                        "provider": provider, "model_id": model["id"],
+                        "rating": caps["rating_milli"],
+                    })
         out.sort(key=lambda c: (1 if self._demoted(c["provider"]["id"]) else 0,
+                                self.attempts.get(c["provider"]["id"], 0) // self.ATTEMPT_BUCKET,
                                 -c["rating"], c["provider"]["id"], c["model_id"]))
+        if out:
+            # Do not trade more than RATING_GATE rating points to save a
+            # call: the cheapest providers are far weaker, and a quality
+            # of 98 instead of 99 leaves no margin at all in the final
+            # trial. The best candidate always passes its own gate.
+            best_rating = max(c["rating"] for c in out)
+            near = [c for c in out if c["rating"] >= best_rating - self.RATING_GATE]
+            if near:
+                out = near
         return out
 
 
@@ -986,8 +1042,40 @@ PARSERS = {
 }
 
 
+def refusal_reason(parsed):
+    """Classify a provider refusal from its wire error envelope.
+
+    The env's refusal message names the cause: a spent free-tier budget
+    or a begun outage is permanent for the trial, a scheduled fail call
+    is transient, and a concurrency refusal spends no budget at all.
+    Returns one of "spent", "outage", "fail", "concurrent", "other".
+    """
+    message = ""
+    if is_record(parsed):
+        error = parsed.get("error")
+        if is_record(error) and isinstance(error.get("message"), str):
+            message = error["message"]
+        elif isinstance(error, str):
+            message = error
+        elif isinstance(parsed.get("message"), str):
+            message = parsed["message"]
+    if "budget is spent" in message:
+        return "spent"
+    if message.endswith(" is out"):
+        return "outage"
+    if "refused this call" in message:
+        return "fail"
+    if "at a time" in message:
+        return "concurrent"
+    return "other"
+
+
 def call_provider(env_url, provider, model_id, normalized):
-    """One upstream call; returns the parsed answer or None on refusal."""
+    """One upstream call; returns (parsed answer or None, refusal reason).
+
+    The reason is None on a usable answer, else one of "spent", "outage",
+    "fail", "concurrent", "other" (see refusal_reason).
+    """
     base = join_base(env_url, provider["base"])
     wire = provider["wire"]
     headers = {"accept": "application/json"}
@@ -1009,8 +1097,13 @@ def call_provider(env_url, provider, model_id, normalized):
         headers["accept"] = "text/event-stream"
     _status, _parsed, raw = http_json("POST", url, headers, body=body, timeout=PROVIDER_TIMEOUT)
     if _status is None:
-        return None
-    return PARSERS[wire](_status, raw)
+        return None, "other"
+    if _status < 200 or _status >= 300:
+        return None, refusal_reason(_parsed)
+    answer = PARSERS[wire](_status, raw)
+    if answer is None:
+        return None, "other"
+    return answer, None
 
 
 # --------------------------------------------------------------------------
@@ -1182,11 +1275,25 @@ class Aggregator:
             return 503, "application/json", json.dumps(openai_error("no free model meets this request", "service_unavailable_error"))
         for candidate in candidates:
             provider = candidate["provider"]
-            answer = call_provider(self.env_url, provider, candidate["model_id"], normalized)
+            answer, reason = call_provider(self.env_url, provider, candidate["model_id"], normalized)
             if answer is None:
-                self.router.note_failure(provider["id"])
+                if reason in ("spent", "outage"):
+                    # A spent budget or a begun outage is permanent: the
+                    # provider can never answer again this trial.
+                    self.router.note_attempt(provider["id"])
+                    self.router.mark_dead(provider["id"])
+                elif reason == "concurrent":
+                    # Refused while another call was in flight: no budget
+                    # was spent, so this is not an attempt to count.
+                    pass
+                else:
+                    # A scheduled fail call (or an unreadable answer):
+                    # the call number was spent, the provider stays alive.
+                    self.router.note_attempt(provider["id"])
+                    self.router.note_failure(provider["id"])
                 continue
             answer_text, usage, family = answer
+            self.router.note_attempt(provider["id"])
             if usage["input"] is None or usage["output"] is None or family is None:
                 self.router.note_failure(provider["id"])
                 continue
